@@ -6,7 +6,7 @@ import torch
 import os
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
-
+import numpy as np
 app = FastAPI()
 
 # CORS middleware to allow requests from the frontend (important!)
@@ -38,41 +38,76 @@ class TTSRequest(BaseModel):
 
 @app.post("/tts/")
 async def generate_tts(request: TTSRequest):
-    text = request.text
+    text = request.text.strip()
     print("[DEBUG] server.generate_tts :: Received text: {}".format(text))
-    if not text.strip():
+
+    if not text:
         print("[ERROR] server.generate_tts :: Text is empty")
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    file_id = str(uuid.uuid4())[:8]  # Generate unique filename
-    file_path = os.path.join(TEMP_DIR, f"{file_id}.wav")
-    print(
-        "[DEBUG] server.generate_tts :: Generating file with id: {}, path: {}".format(
-            file_id, file_path
-        )
-    )
+    paragraphs = text.split("\n")  # Split text into paragraphs
+    file_id = str(uuid.uuid4())[:8]  # Generate unique ID
+    file_paths = []  # Store individual audio file paths
 
-    # Generate speech
     try:
-        generator = pipeline(text, voice="af_heart", speed=1)
-        for _, _, audio in generator:
-            sf.write(file_path, audio, 24000)  # Save generated .wav file
+        for i, para in enumerate(paragraphs):
+            if not para.strip():  # Skip empty paragraphs
+                continue
+
+            temp_file = os.path.join(
+                TEMP_DIR, f"{file_id}_{i}.wav"
+            )  # Unique filename per chunk
+            generator = pipeline(para, voice="af_heart", speed=1)
+
+            for _, _, audio in generator:
+                sf.write(
+                    temp_file, audio, 24000
+                )  # Save each paragraph as a separate file
+                file_paths.append(temp_file)
+                break  # Only process first output per paragraph
+
+            print(f"[DEBUG] server.generate_tts :: Generated {temp_file}")
+
+        # Merge all generated audio files
+        merged_audio_path = os.path.join(TEMP_DIR, f"{file_id}_final.wav")
+        merge_audio_files(file_paths, merged_audio_path)
+
         print(
-            "[DEBUG] server.generate_tts :: Successfully generated speech and saved to {}".format(
-                file_path
-            )
+            f"[DEBUG] server.generate_tts :: Merged audio saved at {merged_audio_path}"
         )
     except Exception as e:
-        print(
-            "[ERROR] server.generate_tts :: Error during speech generation: {}".format(
-                e
-            )
-        )
+        print(f"[ERROR] server.generate_tts :: Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    audio_url = f"http://127.0.0.1:8000/download/{file_id}"
+    audio_url = f"http://127.0.0.1:8000/download/{file_id}_final"
     print("[DEBUG] server.generate_tts :: Returning audio_url: {}".format(audio_url))
-    return {"audio_url": audio_url}  # IMPORTANT: Full URL
+    return {"audio_url": audio_url}
+
+
+def merge_audio_files(input_files, output_file):
+    """Merge multiple WAV files into a single WAV file."""
+    combined_audio = []
+    sample_rate = 24000  # Assuming all audio files are 24kHz
+
+    for file in input_files:
+        audio, sr = sf.read(file)
+        if sr != sample_rate:
+            raise ValueError(
+                f"Sample rate mismatch: {file} has {sr} Hz, expected {sample_rate} Hz."
+            )
+        combined_audio.append(audio)
+
+    # Concatenate all audio arrays
+    merged_audio = np.concatenate(combined_audio, axis=0)
+    sf.write(output_file, merged_audio, sample_rate)  # Save merged file
+
+    # Cleanup individual temp files
+    for file in input_files:
+        os.remove(file)
+
+    print(
+        f"[DEBUG] merge_audio_files :: Merged {len(input_files)} files into {output_file}"
+    )
 
 
 @app.get("/download/{file_id}")
